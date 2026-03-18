@@ -32,6 +32,44 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 
 const TOOLS_REQUIRING_INTERACTION = new Set(['AskUserQuestion']);
 
+/**
+ * Loads environment variables from ~/.claude/settings.json into process.env
+ * This is required for SDK to inherit auth tokens and proxy settings
+ */
+async function loadSettingsEnvToProcess() {
+  try {
+    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+    const content = await fs.readFile(settingsPath, 'utf8');
+    const settings = JSON.parse(content);
+
+    if (settings?.env && typeof settings.env === 'object') {
+      // Set critical auth/env vars that SDK needs
+      const criticalVars = [
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_AUTH_TOKEN',
+        'ANTHROPIC_BASE_URL',
+        'ANTHROPIC_MODEL',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+        'ANTHROPIC_REASONING_MODEL',
+        'CLAUDE_CODE_USE_BEDROCK',
+        'CLAUDE_CODE_USE_VERTEX'
+      ];
+
+      for (const key of criticalVars) {
+        if (settings.env[key] && !process.env[key]) {
+          process.env[key] = settings.env[key];
+          console.log(`Loaded ${key} from settings.json`);
+        }
+      }
+    }
+  } catch (error) {
+    // Ignore missing or malformed settings
+    console.log('No settings.json env vars loaded:', error.message);
+  }
+}
+
 function createRequestId() {
   if (typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -151,11 +189,6 @@ function mapCliOptionsToSDK(options = {}) {
     sdkOptions.cwd = cwd;
   }
 
-  // Map permission mode
-  if (permissionMode && permissionMode !== 'default') {
-    sdkOptions.permissionMode = permissionMode;
-  }
-
   // Map tool settings
   const settings = toolsSettings || {
     allowedTools: [],
@@ -163,10 +196,22 @@ function mapCliOptionsToSDK(options = {}) {
     skipPermissions: false
   };
 
+  // Track whether we should auto-approve tools (original request was bypassPermissions)
+  // This flag is used in canUseTool callback to auto-approve without prompts
+  const shouldAutoApproveTools = (settings.skipPermissions || permissionMode === 'bypassPermissions') && permissionMode !== 'plan';
+
   // Handle tool permissions
-  if (settings.skipPermissions && permissionMode !== 'plan') {
-    // When skipping permissions, use bypassPermissions mode
-    sdkOptions.permissionMode = 'bypassPermissions';
+  // When shouldAutoApproveTools is true, we use the canUseTool callback to auto-approve
+  // all tools without prompting. We don't set permissionMode to 'dontAsk' because that
+  // would prevent canUseTool from being called by the SDK.
+  // Instead, we rely on canUseTool to handle all permission decisions.
+  if (shouldAutoApproveTools) {
+    // Store the flag so canUseTool callback can access it
+    sdkOptions._shouldAutoApproveTools = true;
+    // Don't set permissionMode - let canUseTool handle all permissions
+  } else if (permissionMode && permissionMode !== 'default') {
+    // Only set permissionMode if it's not bypassPermissions (which we handle above)
+    sdkOptions.permissionMode = permissionMode;
   }
 
   let allowedTools = [...(settings.allowedTools || [])];
@@ -482,6 +527,9 @@ async function queryClaudeSDK(command, options = {}, ws) {
   };
 
   try {
+    // Load environment variables from settings.json for SDK authentication
+    await loadSettingsEnvToProcess();
+
     // Map CLI options to SDK format
     const sdkOptions = mapCliOptionsToSDK(options);
 
@@ -521,7 +569,10 @@ async function queryClaudeSDK(command, options = {}, ws) {
       const requiresInteraction = TOOLS_REQUIRING_INTERACTION.has(toolName);
 
       if (!requiresInteraction) {
-        if (sdkOptions.permissionMode === 'bypassPermissions') {
+        // Auto-approve tools when _shouldAutoApproveTools flag is set (from bypassPermissions mode)
+        // This allows non-interactive API calls to use tools without prompts
+        if (sdkOptions._shouldAutoApproveTools || sdkOptions.permissionMode === 'bypassPermissions') {
+          console.log(`Auto-approving tool: ${toolName} (non-interactive mode)`);
           return { behavior: 'allow', updatedInput: input };
         }
 
@@ -600,9 +651,17 @@ async function queryClaudeSDK(command, options = {}, ws) {
       return { behavior: 'deny', message: decision.message ?? 'User denied tool use' };
     };
 
-    // Set stream-close timeout for interactive tools (Query constructor reads it synchronously). Claude Agent SDK has a default of 5s and this overrides it
-    const prevStreamTimeout = process.env.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT;
-    process.env.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT = '300000';
+    // Build env object for SDK, excluding CLAUDECODE to allow nested sessions
+    // SDK spawns a child process that inherits this env
+    const sdkEnv = { ...process.env };
+    delete sdkEnv.CLAUDECODE;  // Critical: allow nested Claude sessions
+    delete sdkEnv.CLAUDE_CODE_ENTRYPOINT;  // Also remove entrypoint marker
+
+    // Set stream-close timeout for interactive tools
+    sdkEnv.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT = '300000';
+
+    // Pass env to SDK options
+    sdkOptions.env = sdkEnv;
 
     let queryInstance;
     try {
@@ -619,13 +678,6 @@ async function queryClaudeSDK(command, options = {}, ws) {
         prompt: finalCommand,
         options: sdkOptions
       });
-    }
-
-    // Restore immediately — Query constructor already captured the value
-    if (prevStreamTimeout !== undefined) {
-      process.env.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT = prevStreamTimeout;
-    } else {
-      delete process.env.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT;
     }
 
     // Track the query instance for abort capability

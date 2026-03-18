@@ -258,6 +258,101 @@ async function getCommitMessages(projectPath, limit = 5) {
 }
 
 /**
+ * Check if there are uncommitted changes in the repository
+ * @param {string} projectPath - Path to the git repository
+ * @returns {Promise<boolean>} - True if there are uncommitted changes
+ */
+async function hasUncommittedChanges(projectPath) {
+  return new Promise((resolve, reject) => {
+    const gitProcess = spawn('git', ['status', '--porcelain'], {
+      cwd: projectPath,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    let stdout = '';
+
+    gitProcess.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    gitProcess.on('close', (code) => {
+      if (code === 0) {
+        resolve(stdout.trim().length > 0);
+      } else {
+        reject(new Error('Failed to check git status'));
+      }
+    });
+
+    gitProcess.on('error', (error) => {
+      reject(new Error(`Failed to execute git: ${error.message}`));
+    });
+  });
+}
+
+/**
+ * Commit all changes in the repository
+ * @param {string} projectPath - Path to the git repository
+ * @param {string} message - Commit message
+ * @returns {Promise<boolean>} - True if commit was made
+ */
+async function commitAllChanges(projectPath, message) {
+  const hasChanges = await hasUncommittedChanges(projectPath);
+  if (!hasChanges) {
+    console.log('ℹ️ No uncommitted changes to commit');
+    return false;
+  }
+
+  return new Promise((resolve, reject) => {
+    // Stage all changes
+    const addProcess = spawn('git', ['add', '-A'], {
+      cwd: projectPath,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    addProcess.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error('Failed to stage changes'));
+        return;
+      }
+
+      // Commit the changes
+      const commitProcess = spawn('git', ['commit', '-m', message], {
+        cwd: projectPath,
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      commitProcess.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      commitProcess.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      commitProcess.on('close', (commitCode) => {
+        if (commitCode === 0) {
+          console.log(`✅ Committed changes: ${message}`);
+          resolve(true);
+        } else {
+          reject(new Error(`Failed to commit: ${stderr}`));
+        }
+      });
+
+      commitProcess.on('error', (error) => {
+        reject(new Error(`Failed to execute git commit: ${error.message}`));
+      });
+    });
+
+    addProcess.on('error', (error) => {
+      reject(new Error(`Failed to execute git add: ${error.message}`));
+    });
+  });
+}
+
+/**
  * Create a new branch on GitHub using the API
  * @param {Octokit} octokit - Octokit instance
  * @param {string} owner - Repository owner
@@ -994,6 +1089,22 @@ router.post('/', validateExternalApiKey, async (req, res) => {
       try {
         console.log('🔄 Starting GitHub branch/PR creation workflow...');
 
+        // If createPR is true, we also need to create a branch
+        const shouldCreateBranch = createBranch || createPR;
+
+        // Auto-commit any uncommitted changes before creating branch
+        try {
+          const hasChanges = await hasUncommittedChanges(finalProjectPath);
+          if (hasChanges) {
+            console.log('📝 Auto-committing uncommitted changes...');
+            const commitMessage = `feat: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`;
+            await commitAllChanges(finalProjectPath, commitMessage);
+          }
+        } catch (commitError) {
+          console.warn('⚠️ Warning: Failed to auto-commit changes:', commitError.message);
+          // Continue anyway - user may want to handle this manually
+        }
+
         // Get GitHub token
         const tokenToUse = githubToken || githubTokensDb.getActiveGithubToken(req.user.id);
 
@@ -1037,7 +1148,7 @@ router.post('/', validateExternalApiKey, async (req, res) => {
           console.log(`🌿 Auto-generated branch name: ${finalBranchName}`);
         }
 
-        if (createBranch) {
+        if (shouldCreateBranch) {
           // Create and checkout the new branch locally
           console.log('🔄 Creating local branch...');
           const checkoutProcess = spawn('git', ['checkout', '-b', finalBranchName], {
@@ -1075,9 +1186,11 @@ router.post('/', validateExternalApiKey, async (req, res) => {
             });
           });
 
-          // Push the branch to remote
+          // Push the branch to remote using token authentication
           console.log('🔄 Pushing branch to remote...');
-          const pushProcess = spawn('git', ['push', '-u', 'origin', finalBranchName], {
+          // Use token-authenticated URL for push
+          const pushUrl = `https://${tokenToUse}@github.com/${owner}/${repo}.git`;
+          const pushProcess = spawn('git', ['push', '-u', pushUrl, finalBranchName], {
             cwd: finalProjectPath,
             stdio: 'pipe'
           });
